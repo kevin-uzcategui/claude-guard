@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# claude-guard — watches your REAL Claude Code plan limits (the same ones shown
+# by /usage: 5h session, weekly global, and weekly per-model) and, when any of
+# them reaches a threshold, runs a configurable action to stop further spend.
+#
+# Cross-platform: Linux (systemd) and macOS (launchd).
+# Config lives in a separate file that is re-read on EVERY check, so changing
+# it takes effect on the next check — no restart needed.
+set -euo pipefail
+
+# ── Paths ────────────────────────────────────────────────────────
+CONF="${CLAUDE_GUARD_CONF:-$HOME/.config/claude-guard.conf}"
+LOG="${CLAUDE_GUARD_LOG:-$HOME/.local/state/claude-guard.log}"
+CREDS="$HOME/.claude/.credentials.json"
+# The Claude Code plugin binary (any IDE: .vscode, cursor, etc.).
+CLAUDE_PATTERN='anthropic\.claude-code.*native-binary/claude'
+
+# ── Defaults (overridden by the config file) ─────────────────────
+THRESHOLD=90
+ACTION=kill-claude
+GRACE_SECONDS=10
+
+# ── Scheduler identifiers ────────────────────────────────────────
+TIMER="claude-guard.timer"
+SERVICE="claude-guard.service"
+PLIST_LABEL="com.claude-guard.check"
+PLIST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
+
+case "$(uname -s)" in
+  Linux)  OS=linux ;;
+  Darwin) OS=mac ;;
+  *)      OS=other ;;
+esac
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "$(date -Is) $*" >>"$LOG"; }
+# shellcheck source=/dev/null
+[[ -f "$CONF" ]] && source "$CONF"
+
+# ── OS-dependent helpers ─────────────────────────────────────────
+notify() {
+  local msg="$1"
+  case "$OS" in
+    linux)
+      command -v notify-send >/dev/null && notify-send -u critical "Claude Code" "$msg" 2>/dev/null || true
+      command -v wall >/dev/null && echo "$msg" | wall 2>/dev/null || true ;;
+    mac)
+      command -v osascript >/dev/null && \
+        osascript -e "display notification \"$msg\" with title \"Claude Code\"" 2>/dev/null || true ;;
+  esac
+}
+
+# Prints the OAuth access token. On Linux it lives in a file; on macOS, in the
+# Keychain. If it cannot be read with confidence, prints nothing (no action).
+get_token() {
+  case "$OS" in
+    mac)
+      local raw
+      raw=$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null || true)
+      [[ -z "$raw" ]] && raw=$(security find-generic-password -l "Claude Code-credentials" -w 2>/dev/null || true)
+      if [[ -n "$raw" ]]; then
+        jq -r '.claudeAiOauth.accessToken // empty' <<<"$raw" 2>/dev/null && return
+      fi
+      [[ -f "$CREDS" ]] && jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null ;;
+    *)
+      [[ -f "$CREDS" ]] && jq -r '.claudeAiOauth.accessToken // empty' "$CREDS" 2>/dev/null ;;
+  esac
+}
+
+power_off() {
+  case "$OS" in
+    linux) systemctl poweroff || sudo -n shutdown -h now ;;
+    mac)   osascript -e 'tell application "System Events" to shut down' 2>/dev/null || sudo -n shutdown -h now ;;
+  esac
+}
+suspend_machine() {
+  case "$OS" in
+    linux) systemctl suspend || sudo -n systemctl suspend ;;
+    mac)   pmset sleepnow ;;
+  esac
+}
+close_editor() {
+  pkill -f "$CLAUDE_PATTERN" 2>/dev/null || true
+  case "$OS" in
+    linux) pkill -f '/code(-insiders)?( |$)|\.vscode-server' ;;
+    mac)   osascript -e 'quit app "Visual Studio Code"' 2>/dev/null || pkill -f 'Visual Studio Code' 2>/dev/null || true ;;
+  esac
+}
+
+# ── Action taken when the threshold is reached ───────────────────
+run_action() {
+  local reason="$1"
+  case "$ACTION" in
+    kill-claude)
+      notify "Limit reached (${reason}). Closing Claude Code in ${GRACE_SECONDS}s…"
+      log "ACTION=kill-claude ($reason) — closing the plugin in ${GRACE_SECONDS}s"
+      sleep "$GRACE_SECONDS"
+      pkill -f "$CLAUDE_PATTERN" && log "Claude Code plugin closed" || log "no plugin to close" ;;
+    vscode)
+      notify "Limit reached (${reason}). Closing the editor in ${GRACE_SECONDS}s…"
+      log "ACTION=vscode ($reason) — closing the editor in ${GRACE_SECONDS}s"
+      sleep "$GRACE_SECONDS"; close_editor && log "editor closed" || log "no editor found" ;;
+    poweroff)
+      notify "Limit reached (${reason}). Powering off in ${GRACE_SECONDS}s…"
+      log "ACTION=poweroff ($reason) — powering off in ${GRACE_SECONDS}s"
+      sleep "$GRACE_SECONDS"; power_off ;;
+    suspend)
+      notify "Limit reached (${reason}). Suspending in ${GRACE_SECONDS}s…"
+      log "ACTION=suspend ($reason) — suspending in ${GRACE_SECONDS}s"
+      sleep "$GRACE_SECONDS"; suspend_machine ;;
+    *) log "ERROR: unknown ACTION '$ACTION' — doing nothing" ;;
+  esac
+}
+
+# ── The check (run by the scheduler every minute) ────────────────
+do_check() {
+  local token resp summary exceeded
+  token=$(get_token || true)
+  if [[ -z "$token" ]]; then
+    log "ERROR: could not read the OAuth token — skipping check"; return 0
+  fi
+  resp=$(curl -s -m 30 \
+    -H "Authorization: Bearer $token" \
+    -H "anthropic-beta: oauth-2025-04-20" \
+    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || true)
+  if ! jq -e '.limits' >/dev/null 2>&1 <<<"$resp"; then
+    log "ERROR: unexpected endpoint response — skipping check. Raw: $(head -c 200 <<<"$resp" | tr '\n' ' ' | tr -s ' ')"; return 0
+  fi
+  summary=$(jq -r '[.limits[] | "\(.kind)=\(.percent)%"] | join(", ")' <<<"$resp")
+  log "limits: ${summary} (threshold: ${THRESHOLD}%, action: ${ACTION})"
+  exceeded=$(jq -r --argjson t "$THRESHOLD" \
+    '[.limits[] | select(.percent >= $t) | "\(.kind) \(.percent)%"] | join(", ")' <<<"$resp")
+  [[ -n "$exceeded" ]] && { log "THRESHOLD EXCEEDED ($exceeded)"; run_action "$exceeded"; }
+  return 0
+}
+
+# ── Scheduler control (systemd / launchd) ────────────────────────
+scheduler_active() {
+  case "$OS" in
+    linux) systemctl --user is-active --quiet "$TIMER" ;;
+    mac)   launchctl list 2>/dev/null | grep -q "$PLIST_LABEL" ;;
+  esac
+}
+enable_guard() {
+  case "$OS" in
+    linux) systemctl --user enable --now "$TIMER" ;;
+    mac)   launchctl unload "$PLIST" 2>/dev/null || true; launchctl load -w "$PLIST" ;;
+  esac
+}
+disable_guard() {
+  case "$OS" in
+    linux) systemctl --user disable --now "$TIMER" ;;
+    mac)   launchctl unload -w "$PLIST" 2>/dev/null || true ;;
+  esac
+}
+scheduler_status() {
+  case "$OS" in
+    linux) systemctl --user list-timers "$TIMER" --no-pager 2>/dev/null | sed -n '1,2s/^/  /p' || true ;;
+    mac)   launchctl list 2>/dev/null | grep "$PLIST_LABEL" | sed 's/^/  /' || echo "  (not loaded)" ;;
+  esac
+}
+
+# ── Config helpers ───────────────────────────────────────────────
+set_conf() {
+  local key="$1" value="$2"
+  mkdir -p "$(dirname "$CONF")"; touch "$CONF"
+  if grep -qE "^${key}=" "$CONF" 2>/dev/null; then
+    sed -i.bak -E "s|^${key}=.*|${key}=${value}|" "$CONF" && rm -f "${CONF}.bak"
+  else
+    echo "${key}=${value}" >>"$CONF"
+  fi
+}
+get_conf() { grep -E "^$1=" "$CONF" 2>/dev/null | tail -1 | cut -d= -f2-; }
+
+usage() {
+  cat <<'EOF'
+Usage: claude-guard [command]
+
+  (none) | status   Config + guard state + recent checks
+  <number>          Set the threshold %       (e.g. claude-guard 50)
+  action <value>    kill-claude | vscode | poweroff | suspend
+  grace <seconds>   Seconds of warning before acting
+  on | off          Turn the guard on / off
+  now               Run a check right now
+  check             (internal, used by the scheduler) run one check
+  log               Follow the log live (Ctrl-C to exit)
+EOF
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────
+cmd="${1:-status}"
+case "$cmd" in
+  check) do_check ;;
+  now)   echo "Running a check…"; do_check; tail -n 2 "$LOG" 2>/dev/null | sed 's/^/  /' ;;
+  status|"")
+    echo "── Config (${CONF}) ──"
+    echo "  OS:         ${OS}"
+    echo "  Threshold:  $(get_conf THRESHOLD)%"
+    echo "  Action:     $(get_conf ACTION)"
+    echo "  Grace:      $(get_conf GRACE_SECONDS)s"
+    echo
+    echo "── Guard ──"
+    if scheduler_active; then echo "  State:   ON  ✓"; else echo "  State:   OFF ✗   (turn it on with: claude-guard on)"; fi
+    scheduler_status
+    echo
+    echo "── Recent checks ──"
+    tail -n 5 "$LOG" 2>/dev/null | sed 's/^/  /' || echo "  (no records yet)"
+    ;;
+  action)
+    case "${2:-}" in
+      kill-claude|vscode|poweroff|suspend) set_conf ACTION "$2"; echo "Action set to: $2" ;;
+      *) echo "Invalid action. Use: kill-claude | vscode | poweroff | suspend"; exit 1 ;;
+    esac ;;
+  grace)
+    [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "Give a number of seconds. e.g. claude-guard grace 15"; exit 1; }
+    set_conf GRACE_SECONDS "$2"; echo "Grace set to: ${2}s" ;;
+  on)  enable_guard;  echo "Guard turned ON  ✓" ;;
+  off) disable_guard; echo "Guard turned OFF ✗" ;;
+  log) tail -f "$LOG" ;;
+  -h|--help|help) usage ;;
+  *)
+    if [[ "$cmd" =~ ^[0-9]+$ ]]; then
+      (( cmd >= 1 && cmd <= 100 )) || { echo "Threshold must be between 1 and 100."; exit 1; }
+      set_conf THRESHOLD "$cmd"; echo "Threshold set to: ${cmd}%"
+    else
+      echo "Unknown command: $cmd"; echo; usage; exit 1
+    fi ;;
+esac

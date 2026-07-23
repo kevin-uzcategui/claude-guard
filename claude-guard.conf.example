@@ -1,0 +1,16 @@
+# claude-guard config. Re-read on every check (once a minute), so changes
+# apply on their own. Edit by hand or with `claude-guard`.
+
+# Threshold (%) that triggers the action. Compared against the 3 real plan
+# limits (5h session, weekly global, weekly per-model): fires if ANY reaches it.
+THRESHOLD=90
+
+# What to do when the threshold is reached:
+#   kill-claude  -> close only Claude Code (the plugin). Leaves the editor open.
+#   vscode       -> close the whole editor (and whatever runs inside it).
+#   poweroff     -> power off the machine.
+#   suspend      -> suspend (sleep) the machine.
+ACTION=kill-claude
+
+# Seconds of warning before acting.
+GRACE_SECONDS=10

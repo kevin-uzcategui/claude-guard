@@ -1,0 +1,7 @@
+# Local runtime artifacts (never part of the repo)
+*.log
+*.bak
+
+# OS cruft
+.DS_Store
+Thumbs.db
