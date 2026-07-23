@@ -14,3 +14,7 @@ ACTION=kill-claude
 
 # Seconds of warning before acting.
 GRACE_SECONDS=10
+
+# How often to check, in seconds (min 30). Change it with `claude-guard interval`
+# (accepts 90s / 2m / 1h) so the scheduler is regenerated automatically.
+INTERVAL_SECONDS=120

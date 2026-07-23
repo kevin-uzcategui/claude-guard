@@ -19,10 +19,12 @@ CLAUDE_PATTERN='anthropic\.claude-code.*native-binary/claude'
 THRESHOLD=90
 ACTION=kill-claude
 GRACE_SECONDS=10
+INTERVAL_SECONDS=60
 
 # ── Scheduler identifiers ────────────────────────────────────────
 TIMER="claude-guard.timer"
 SERVICE="claude-guard.service"
+UNIT_DIR="$HOME/.config/systemd/user"
 PLIST_LABEL="com.claude-guard.check"
 PLIST="$HOME/Library/LaunchAgents/${PLIST_LABEL}.plist"
 
@@ -143,8 +145,10 @@ scheduler_active() {
 }
 enable_guard() {
   case "$OS" in
-    linux) systemctl --user enable --now "$TIMER" ;;
-    mac)   launchctl unload "$PLIST" 2>/dev/null || true; launchctl load -w "$PLIST" ;;
+    linux) [[ -f "$UNIT_DIR/$TIMER" ]] || sync_scheduler
+           systemctl --user enable --now "$TIMER" ;;
+    mac)   [[ -f "$PLIST" ]] || sync_scheduler
+           launchctl unload "$PLIST" 2>/dev/null || true; launchctl load -w "$PLIST" ;;
   esac
 }
 disable_guard() {
@@ -157,6 +161,76 @@ scheduler_status() {
   case "$OS" in
     linux) systemctl --user list-timers "$TIMER" --no-pager 2>/dev/null | sed -n '1,2s/^/  /p' || true ;;
     mac)   launchctl list 2>/dev/null | grep "$PLIST_LABEL" | sed 's/^/  /' || echo "  (not loaded)" ;;
+  esac
+}
+
+# ── Interval parsing + scheduler (re)generation ──────────────────
+human_secs() {  # 120 -> "2m", 3600 -> "1h", 90 -> "90s"
+  local s="${1:-0}"
+  if   (( s > 0 && s % 3600 == 0 )); then echo "$((s/3600))h"
+  elif (( s > 0 && s % 60 == 0 ));   then echo "$((s/60))m"
+  else echo "${s}s"; fi
+}
+parse_interval() {  # "2m" | "120s" | "1h" | "120" -> seconds (empty if invalid)
+  local v="${1:-}"
+  [[ "$v" =~ ^([0-9]+)([smh]?)$ ]] || { echo ""; return; }
+  local n="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}"
+  case "$u" in h) echo $((n*3600)) ;; m) echo $((n*60)) ;; *) echo "$n" ;; esac
+}
+write_scheduler() {  # $1 = seconds; (re)writes the unit/plist, no enable
+  local secs="$1"
+  case "$OS" in
+    linux)
+      mkdir -p "$UNIT_DIR"
+      cat > "$UNIT_DIR/$SERVICE" <<EOF
+[Unit]
+Description=Watch Claude Code usage and act on limit
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/claude-guard check
+EOF
+      cat > "$UNIT_DIR/$TIMER" <<EOF
+[Unit]
+Description=Periodic Claude Code usage check
+
+[Timer]
+OnBootSec=${secs}s
+OnUnitActiveSec=${secs}s
+
+[Install]
+WantedBy=timers.target
+EOF
+      systemctl --user daemon-reload ;;
+    mac)
+      mkdir -p "$(dirname "$PLIST")"
+      cat > "$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${PLIST_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>${HOME}/.local/bin/claude-guard</string>
+    <string>check</string>
+  </array>
+  <key>StartInterval</key><integer>${secs}</integer>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+EOF
+      ;;
+  esac
+}
+sync_scheduler() {  # regenerate from config; reload if currently active
+  local secs; secs=$(parse_interval "$(get_conf INTERVAL_SECONDS)"); secs=${secs:-60}
+  (( secs < 30 )) && secs=30
+  write_scheduler "$secs"
+  case "$OS" in
+    linux) scheduler_active && systemctl --user restart "$TIMER" || true ;;
+    mac)   launchctl list 2>/dev/null | grep -q "$PLIST_LABEL" && \
+             { launchctl unload "$PLIST" 2>/dev/null || true; launchctl load -w "$PLIST"; } || true ;;
   esac
 }
 
@@ -180,6 +254,7 @@ Usage: claude-guard [command]
   <number>          Set the threshold %       (e.g. claude-guard 50)
   action <value>    kill-claude | vscode | poweroff | suspend
   grace <seconds>   Seconds of warning before acting
+  interval <value>  How often to check: 90s | 2m | 1h  (min 30s)
   on | off          Turn the guard on / off
   now               Run a check right now
   check             (internal, used by the scheduler) run one check
@@ -195,9 +270,11 @@ case "$cmd" in
   status|"")
     echo "── Config (${CONF}) ──"
     echo "  OS:         ${OS}"
+    iv=$(get_conf INTERVAL_SECONDS); iv=${iv:-60}
     echo "  Threshold:  $(get_conf THRESHOLD)%"
     echo "  Action:     $(get_conf ACTION)"
     echo "  Grace:      $(get_conf GRACE_SECONDS)s"
+    echo "  Interval:   ${iv}s ($(human_secs "$iv"))"
     echo
     echo "── Guard ──"
     if scheduler_active; then echo "  State:   ON  ✓"; else echo "  State:   OFF ✗   (turn it on with: claude-guard on)"; fi
@@ -214,6 +291,13 @@ case "$cmd" in
   grace)
     [[ "${2:-}" =~ ^[0-9]+$ ]] || { echo "Give a number of seconds. e.g. claude-guard grace 15"; exit 1; }
     set_conf GRACE_SECONDS "$2"; echo "Grace set to: ${2}s" ;;
+  interval)
+    secs=$(parse_interval "${2:-}")
+    [[ -n "$secs" ]] || { echo "Invalid interval. Use e.g. 90s, 2m, 1h."; exit 1; }
+    (( secs >= 30 )) || { echo "Interval too small; minimum is 30s."; exit 1; }
+    set_conf INTERVAL_SECONDS "$secs"; sync_scheduler
+    echo "Interval set to: ${secs}s ($(human_secs "$secs"))" ;;
+  sync-scheduler) sync_scheduler ;;
   on)  enable_guard;  echo "Guard turned ON  ✓" ;;
   off) disable_guard; echo "Guard turned OFF ✗" ;;
   log) tail -f "$LOG" ;;
