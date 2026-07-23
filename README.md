@@ -5,9 +5,9 @@ Watches your **real Claude Code plan limits** (the same ones shown by `/usage`:
 reaches a threshold, runs an action to stop further spend: close Claude Code,
 close the editor, suspend, or power off the machine.
 
-It checks once a minute in the background. If it can't read your usage with
-confidence (expired token, no internet), it **does nothing** — it never acts
-blind.
+It checks every couple of minutes in the background (interval configurable,
+2 min by default). If it can't read your usage with confidence (expired token,
+no internet), it **does nothing** — it never acts blind.
 
 > ⚠️ **Unofficial tool.** It reads your own local Claude Code OAuth token to
 > call an internal, undocumented usage endpoint, and it can **close apps or
@@ -39,6 +39,7 @@ claude-guard status         # config + guard state + recent checks
 claude-guard 50             # set the threshold to 50% (1–100)
 claude-guard action vscode  # kill-claude | vscode | poweroff | suspend
 claude-guard grace 15       # seconds of warning before acting
+claude-guard interval 2m    # how often to check (90s | 2m | 1h, min 30s)
 claude-guard off / on       # turn the guard off / on
 claude-guard now            # run a check right now
 claude-guard log            # follow the log live

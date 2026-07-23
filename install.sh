@@ -46,56 +46,15 @@ if [[ $OS == linux ]]; then
   rm -f "$HOME/.local/bin/claude-usage-guard.sh"
 fi
 
-# ── Scheduler ────────────────────────────────────────────────────
+# ── Scheduler (built from the config interval, delegated to the binary) ──
+"$BIN/claude-guard" sync-scheduler
+"$BIN/claude-guard" on >/dev/null
 if [[ $OS == linux ]]; then
-  UNIT_DIR="$HOME/.config/systemd/user"; mkdir -p "$UNIT_DIR"
-  cat > "$UNIT_DIR/claude-guard.service" <<EOF
-[Unit]
-Description=Watch Claude Code usage and act on limit
-
-[Service]
-Type=oneshot
-ExecStart=%h/.local/bin/claude-guard check
-EOF
-  cat > "$UNIT_DIR/claude-guard.timer" <<EOF
-[Unit]
-Description=Periodic Claude Code usage check
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-
-[Install]
-WantedBy=timers.target
-EOF
-  systemctl --user daemon-reload
-  systemctl --user enable --now claude-guard.timer
   loginctl enable-linger "$USER" >/dev/null 2>&1 || \
     echo "  (note: could not enable 'linger'; the guard will only run while you are logged in)"
-  echo "✔ systemd timer active (every 1 min)."
-else
-  LA="$HOME/Library/LaunchAgents"; mkdir -p "$LA"
-  PLIST="$LA/com.claude-guard.check.plist"
-  cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.claude-guard.check</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$BIN/claude-guard</string>
-    <string>check</string>
-  </array>
-  <key>StartInterval</key><integer>60</integer>
-  <key>RunAtLoad</key><true/>
-</dict>
-</plist>
-EOF
-  launchctl unload "$PLIST" 2>/dev/null || true
-  launchctl load -w "$PLIST"
-  echo "✔ launchd LaunchAgent active (every 60s)."
 fi
+interval=$(grep -E '^INTERVAL_SECONDS=' "$CONF" | tail -1 | cut -d= -f2)
+echo "✔ Guard active (checks every ${interval:-60}s)."
 
 # ── PATH ─────────────────────────────────────────────────────────
 case ":$PATH:" in
