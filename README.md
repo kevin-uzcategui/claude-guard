@@ -61,6 +61,37 @@ You can also edit `~/.config/claude-guard.conf` directly.
 > it again every minute. To keep working: lower the threshold or run
 > `claude-guard off`.
 
+## Use cases
+
+**Leave a long task running overnight, then power off.**
+You kick off a long autonomous task before bed. Once the plan limit is hit,
+Claude can't do more, so there's no point keeping the machine on until morning
+— have claude-guard shut it down:
+
+```bash
+claude-guard action poweroff
+claude-guard 95            # use almost the whole session before acting
+claude-guard grace 60      # a minute of warning, just in case
+```
+
+**Step away while Claude works (AFK).**
+You leave Claude on a task and go do something else. When the limit is reached,
+just stop Claude so it doesn't keep hammering the API (and eating your weekly
+allowance) — the machine stays on and everything else keeps running:
+
+```bash
+claude-guard action kill-claude   # the default
+claude-guard 90
+```
+
+**Laptop on battery.**
+Same as AFK, but sleep the machine to save battery instead of only closing
+Claude:
+
+```bash
+claude-guard action suspend
+```
+
 ## Uninstall
 
 ```bash
