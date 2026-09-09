@@ -10,6 +10,9 @@ THRESHOLD=90
 #   vscode       -> close the whole editor (and whatever runs inside it).
 #   poweroff     -> power off the machine.
 #   suspend      -> suspend (sleep) the machine.
+# poweroff and suspend turn the guard off as they act, so bringing the machine
+# back does not stop it again while the limit is still exceeded. Re-arm it with
+# `claude-guard on`.
 ACTION=kill-claude
 
 # Seconds of warning before acting.

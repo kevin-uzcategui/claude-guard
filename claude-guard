@@ -89,6 +89,27 @@ close_editor() {
   esac
 }
 
+# poweroff and suspend stop the machine while the limit is still exceeded, so the
+# guard turns itself off before acting. Otherwise the next boot (or resume) runs
+# the check, finds the very same limit, and stops the machine again: a loop with
+# no way out until the limit window rolls over. Turn it back on with:
+#   claude-guard on
+# It never takes down the process running this action: on Linux only the timer
+# unit is stopped (the service running this script is a separate unit), and on
+# macOS the job is marked disabled instead of unloaded, which would kill it.
+self_disable() {
+  local what="$1" ok=0
+  case "$OS" in
+    linux) systemctl --user disable --now "$TIMER" >/dev/null 2>&1 && ok=1 ;;
+    mac)   launchctl disable "gui/$(id -u)/${PLIST_LABEL}" >/dev/null 2>&1 && ok=1 ;;
+  esac
+  if (( ok )); then
+    log "guard self-disabled before ${what} — turn it back on with: claude-guard on"
+  else
+    log "WARNING: could not self-disable the guard before ${what}"
+  fi
+}
+
 # ── Action taken when the threshold is reached ───────────────────
 run_action() {
   local reason="$1"
@@ -103,12 +124,14 @@ run_action() {
       log "ACTION=vscode ($reason) — closing the editor in ${GRACE_SECONDS}s"
       sleep "$GRACE_SECONDS"; close_editor && log "editor closed" || log "no editor found" ;;
     poweroff)
-      notify "Limit reached (${reason}). Powering off in ${GRACE_SECONDS}s…"
+      notify "Limit reached (${reason}). Powering off in ${GRACE_SECONDS}s… The guard turns itself off, so the next boot will not power off again."
       log "ACTION=poweroff ($reason) — powering off in ${GRACE_SECONDS}s"
+      self_disable poweroff
       sleep "$GRACE_SECONDS"; power_off ;;
     suspend)
-      notify "Limit reached (${reason}). Suspending in ${GRACE_SECONDS}s…"
+      notify "Limit reached (${reason}). Suspending in ${GRACE_SECONDS}s… The guard turns itself off, so waking up will not suspend again."
       log "ACTION=suspend ($reason) — suspending in ${GRACE_SECONDS}s"
+      self_disable suspend
       sleep "$GRACE_SECONDS"; suspend_machine ;;
     *) log "ERROR: unknown ACTION '$ACTION' — doing nothing" ;;
   esac
@@ -148,6 +171,7 @@ enable_guard() {
     linux) [[ -f "$UNIT_DIR/$TIMER" ]] || sync_scheduler
            systemctl --user enable --now "$TIMER" ;;
     mac)   [[ -f "$PLIST" ]] || sync_scheduler
+           launchctl enable "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
            launchctl unload "$PLIST" 2>/dev/null || true; launchctl load -w "$PLIST" ;;
   esac
 }

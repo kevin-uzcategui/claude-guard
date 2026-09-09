@@ -54,12 +54,18 @@ You can also edit `~/.config/claude-guard.conf` directly.
 |---|---|---|
 | `kill-claude` | Closes only the Claude Code plugin | Reopen the panel |
 | `vscode` | Closes the whole editor | Reopen VS Code |
-| `poweroff` | Powers off the machine | Turn it back on |
-| `suspend` | Suspends (sleeps) the machine | Wake it |
+| `poweroff` | Powers off the machine | Turn it back on, then `claude-guard on` |
+| `suspend` | Suspends (sleeps) the machine | Wake it, then `claude-guard on` |
 
 > With `kill-claude`, if you're still above the threshold the guard will close
 > it again every minute. To keep working: lower the threshold or run
 > `claude-guard off`.
+
+> `poweroff` and `suspend` **turn the guard off on their way out**. The limit is
+> still exceeded when the machine stops, so a guard left on would power off (or
+> re-suspend) the machine again as soon as you brought it back, and you could
+> not use it until the limit window rolled over. Once you are back up, switch it
+> on again with `claude-guard on`.
 
 ## Use cases
 
@@ -73,6 +79,9 @@ claude-guard action poweroff
 claude-guard 95            # use almost the whole session before acting
 claude-guard grace 60      # a minute of warning, just in case
 ```
+
+It powers off once: the guard turns itself off before shutting down, so you can
+boot in the morning and work. Re-arm it with `claude-guard on`.
 
 **Step away while Claude works (AFK).**
 You leave Claude on a task and go do something else. When the limit is reached,
