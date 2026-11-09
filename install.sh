@@ -16,7 +16,15 @@ echo "▶ Detected system: $OS"
 
 # ── Dependencies ─────────────────────────────────────────────────
 missing=""
-for dep in jq curl; do command -v "$dep" >/dev/null 2>&1 || missing="$missing $dep"; done
+deps="jq curl"
+[[ "$OS" == linux ]] && deps="$deps flock"
+for dep in $deps; do
+  if ! command -v "$dep" >/dev/null 2>&1; then
+    package="$dep"
+    [[ "$dep" == flock ]] && package=util-linux
+    missing="$missing $package"
+  fi
+done
 if [[ -n "$missing" ]]; then
   echo "✗ Missing dependencies:$missing"
   [[ $OS == mac ]]   && echo "  Install with:  brew install$missing"

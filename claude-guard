@@ -12,6 +12,8 @@ set -euo pipefail
 CONF="${CLAUDE_GUARD_CONF:-$HOME/.config/claude-guard.conf}"
 LOG="${CLAUDE_GUARD_LOG:-$HOME/.local/state/claude-guard.log}"
 CREDS="$HOME/.claude/.credentials.json"
+STATE_DIR="${CLAUDE_GUARD_STATE_DIR:-$HOME/.local/state/claude-guard}"
+STATE="$STATE_DIR/health.json"
 # The Claude Code plugin binary (any IDE: .vscode, cursor, etc.).
 CLAUDE_PATTERN='anthropic\.claude-code.*native-binary/claude'
 
@@ -33,6 +35,10 @@ case "$(uname -s)" in
   Darwin) OS=mac ;;
   *)      OS=other ;;
 esac
+
+CLAUDE_IDENTITY="$HOME/.claude.json"
+if [[ "$OS" == mac ]]; then DESKTOP_DATA_DIR="$HOME/Library/Application Support/Claude"
+else DESKTOP_DATA_DIR="$HOME/.config/Claude"; fi
 
 mkdir -p "$(dirname "$LOG")"
 log() { echo "$(date -Is) $*" >>"$LOG"; }
@@ -81,6 +87,54 @@ suspend_machine() {
     mac)   pmset sleepnow ;;
   esac
 }
+# Exact Desktop process matching avoids targeting the guard or unrelated apps.
+terminate_target() {
+  local label="$1" code attempt
+  shift
+  if pkill -u "$(id -u)" "$@" 2>/dev/null; then
+    for attempt in 1 2 3 4 5; do
+      if ! pgrep -u "$(id -u)" "$@" >/dev/null 2>&1; then
+        log "$label closed"
+        return 0
+      fi
+      sleep 1
+    done
+    log "$label still running after SIGTERM; forcing termination"
+    if ! pkill -KILL -u "$(id -u)" "$@" 2>/dev/null; then
+      if ! pgrep -u "$(id -u)" "$@" >/dev/null 2>&1; then
+        log "$label closed"
+        return 0
+      fi
+      log "ERROR: could not force termination of $label"
+      return 1
+    fi
+    for attempt in 1 2 3 4 5; do
+      if ! pgrep -u "$(id -u)" "$@" >/dev/null 2>&1; then
+        log "$label closed (SIGKILL required)"
+        return 0
+      fi
+      sleep 1
+    done
+    log "ERROR: $label still running after SIGKILL"
+    return 1
+  else
+    code=$?
+    if (( code == 1 )); then log "$label not running"; return 0; fi
+    log "ERROR: could not terminate $label (pkill exit $code)"
+    return 1
+  fi
+}
+
+close_claude() {
+  local failed=0
+  terminate_target "Claude Code plugin" -f "$CLAUDE_PATTERN" || failed=1
+  case "$OS" in
+    linux) terminate_target "Claude Desktop" -x claude-desktop || failed=1 ;;
+    mac) terminate_target "Claude Desktop" -f '^/.*Claude\.app/Contents/MacOS/Claude([[:space:]]|$)' || failed=1 ;;
+  esac
+  return "$failed"
+}
+
 close_editor() {
   pkill -f "$CLAUDE_PATTERN" 2>/dev/null || true
   case "$OS" in
@@ -115,10 +169,10 @@ run_action() {
   local reason="$1"
   case "$ACTION" in
     kill-claude)
-      notify "Limit reached (${reason}). Closing Claude Code in ${GRACE_SECONDS}s…"
-      log "ACTION=kill-claude ($reason) — closing the plugin in ${GRACE_SECONDS}s"
+      notify "Limit reached (${reason}). Closing Claude Desktop and Claude Code in ${GRACE_SECONDS}s…"
+      log "ACTION=kill-claude ($reason): closing Claude Desktop and the Claude Code plugin in ${GRACE_SECONDS}s"
       sleep "$GRACE_SECONDS"
-      pkill -f "$CLAUDE_PATTERN" && log "Claude Code plugin closed" || log "no plugin to close" ;;
+      close_claude ;;
     vscode)
       notify "Limit reached (${reason}). Closing the editor in ${GRACE_SECONDS}s…"
       log "ACTION=vscode ($reason) — closing the editor in ${GRACE_SECONDS}s"
@@ -137,27 +191,257 @@ run_action() {
   esac
 }
 
-# ── The check (run by the scheduler every minute) ────────────────
-do_check() {
-  local token resp summary exceeded
+# Persist health separately from the timer state. Never store tokens here.
+set_health() {
+  local status="$1" delay="${2:-0}" now last_success=0 failures=0 tmp
+  now=$(date +%s)
+  if [[ -f "$STATE" ]]; then
+    last_success=$(jq -r '.last_success // 0' "$STATE" 2>/dev/null) || last_success=0
+    failures=$(jq -r '.failures // 0' "$STATE" 2>/dev/null) || failures=0
+  fi
+  if [[ "$status" == ok ]]; then last_success=$now; failures=0
+  else failures=$((failures + 1)); fi
+  tmp=$(mktemp "$STATE_DIR/health.XXXXXX")
+  jq -n --arg status "$status" --argjson now "$now" \
+    --argjson next "$((now + delay))" --argjson last "$last_success" \
+    --argjson failures "$failures" \
+    '{status:$status,primary_status:$status,source:(if $status == "ok" then "oauth" else null end),checked_at:$now,next_attempt:$next,last_success:$last,failures:$failures}' >"$tmp"
+  mv "$tmp" "$STATE"
+}
+
+# Use the same refresh grant as Claude Code, without invoking inference. On
+# macOS Claude owns the Keychain session; ask it to renew rather than modifying
+# a potentially different file credential. Linux updates the existing JSON
+# atomically and preserves unrelated fields.
+refresh_token() {
+  local snapshot reply code tmp current headers
+  REFRESH_STATUS=authentication_error
+  REFRESH_DELAY=300
+  if [[ "$OS" == mac ]]; then
+    log "ERROR: OAuth session needs renewal in Claude Code (/login)"
+    return 1
+  fi
+  snapshot=$(cat "$CREDS" 2>/dev/null) || return 1
+  if ! jq -e '.claudeAiOauth.refreshToken | type == "string" and length > 0' <<<"$snapshot" >/dev/null; then
+    log "ERROR: no refresh token; sign in again in Claude Code (/login)"
+    return 1
+  fi
+  headers=$(mktemp "$STATE_DIR/refresh-headers.XXXXXX")
+  reply=$(jq '{grant_type:"refresh_token",refresh_token:.claudeAiOauth.refreshToken,
+      client_id:(.claudeAiOauth.clientId // "9d1c250a-e61b-44d9-88ed-5944d1962f5e"),
+      scope:(.claudeAiOauth.scopes | join(" "))}' <<<"$snapshot" |
+    curl -sS --connect-timeout 10 -m 30 -D "$headers" -w '\n%{http_code}' \
+      -H 'Content-Type: application/json' --data-binary @- \
+      'https://platform.claude.com/v1/oauth/token' 2>/dev/null) || {
+    rm -f "$headers"
+    REFRESH_STATUS=network_error
+    log "ERROR: OAuth refresh network failure"; return 1;
+  }
+  code="${reply##*$'\n'}"; reply="${reply%$'\n'*}"
+  if [[ "$code" == 429 ]]; then
+    REFRESH_STATUS=refresh_rate_limited
+    REFRESH_DELAY=$(retry_delay "$headers")
+    rm -f "$headers"
+    log "ERROR: OAuth refresh rate limited (HTTP 429); retry in ${REFRESH_DELAY}s"
+    return 1
+  fi
+  rm -f "$headers"
+  if [[ "$code" != 200 ]] || ! jq -e '
+    (.access_token | type == "string" and length > 0) and
+    (.expires_in | type == "number" and . > 0)' <<<"$reply" >/dev/null 2>&1; then
+    log "ERROR: OAuth refresh failed (HTTP $code); renew the session in Claude Code (/login)"
+    return 1
+  fi
+  current=$(cat "$CREDS")
+  if [[ "$current" != "$snapshot" ]]; then
+    log "OAuth credentials changed during refresh; keeping Claude Code credentials"
+    return 0
+  fi
+  tmp=$(mktemp "${CREDS}.XXXXXX")
+  # Pass the grant through stdin so secrets do not appear in process arguments.
+  if ! printf '%s\n%s\n' "$snapshot" "$reply" | jq -s --argjson now "$(date +%s)" '
+    .[0] as $old | .[1] as $new | $old |
+    .claudeAiOauth.accessToken = $new.access_token |
+    .claudeAiOauth.refreshToken = ($new.refresh_token // .claudeAiOauth.refreshToken) |
+    .claudeAiOauth.expiresAt = (($now + $new.expires_in) * 1000) |
+    if $new.scope then .claudeAiOauth.scopes = ($new.scope | split(" ")) else . end |
+    if $new.refresh_token_expires_in then
+      .claudeAiOauth.refreshTokenExpiresAt = (($now + $new.refresh_token_expires_in) * 1000)
+    else . end' >"$tmp"; then
+    rm -f "$tmp"; return 1
+  fi
+  mv "$tmp" "$CREDS"
+  log "OAuth session renewed"
+}
+
+# Share retry policy between usage and authentication requests.
+retry_delay() {
+  local headers="$1" failures delay retry
+  failures=$(jq -r '.failures // 0' "$STATE" 2>/dev/null) || failures=0
+  (( failures > 4 )) && failures=4
+  delay=$((120 * (2 ** failures)))
+  retry=$(awk 'tolower($1) == "retry-after:" {gsub("\r", "", $2); if ($2 ~ /^[0-9]+$/) print $2}' "$headers" | tail -1)
+  if [[ "$retry" =~ ^[0-9]+$ ]] && (( retry > delay )); then delay=$retry; fi
+  echo "$delay"
+}
+
+normalize_limits() {
+  jq -ce '
+    if (.limits | type) == "array" then .limits
+    else [to_entries[] | select(.key == "five_hour" or (.key | startswith("seven_day"))) |
+      select(.value != null) | {kind:.key,percent:.value.utilization}] end |
+    if length > 0 and all(.[];
+      (.kind | type == "string" and length > 0) and
+      (.percent | type == "number" and . >= 0))
+    then . else error("unrecognized usage limits") end'
+}
+
+# Desktop writes this history only after a successful usage response. Read it
+# without touching cookies or credentials. Identity, org, schema and sample age
+# must all match; extra-usage spending (xu) is deliberately not a plan limit.
+read_desktop_usage() {
+  jq -nce --argjson now "$(date +%s)" \
+    --slurpfile identity "$CLAUDE_IDENTITY" \
+    --slurpfile config "$DESKTOP_DATA_DIR/config.json" \
+    --slurpfile history "$DESKTOP_DATA_DIR/plan-usage-history.json" '
+    $identity[0].oauthAccount as $id |
+    if ($id.accountUuid | type) != "string" or ($id.accountUuid | length) == 0 or
+       ($id.organizationUuid | type) != "string" or ($id.organizationUuid | length) == 0 or
+       $config[0].lastKnownAccountUuid != $id.accountUuid
+    then error("account mismatch or missing identity") else . end |
+    if $history[0].version != 2 or ($history[0].samples | type) != "array"
+    then error("unsupported Desktop history") else . end |
+    ($history[0].samples | max_by(.t)) as $sample |
+    if $sample.org != $id.organizationUuid or ($sample.t | type) != "number" or
+       ($sample.u | type) != "object" or ($sample.t / 1000) > ($now + 1) or
+       ($now - $sample.t / 1000) > 300
+    then error("wrong organization, stale or future Desktop sample") else . end |
+    if ($sample.u.fh | type) != "number" or ($sample.u.sd | type) != "number"
+    then error("incomplete Desktop global usage") else . end |
+    {fh:"session",sd:"weekly_all",so:"weekly_opus",sn:"weekly_sonnet",
+     oa:"weekly_oauth_apps",cw:"weekly_cowork",om:"weekly_omelette",op:"omelette_promotional"} as $names |
+    [$sample.u | to_entries[] | select($names[.key] != null) |
+      {kind:$names[.key],percent:.value}] as $limits |
+    if all($limits[]; (.percent | type == "number" and . >= 0)) then
+      {limits:$limits,sampled_at:($sample.t / 1000 | floor)}
+    else error("invalid Desktop percentage") end'
+}
+
+apply_limits() {
+  local limits="$1" source="$2" summary exceeded
+  summary=$(jq -r '[.[] | "\(.kind)=\(.percent)%"] | join(", ")' <<<"$limits")
+  log "limits: ${summary} (source: ${source}, threshold: ${THRESHOLD}%, action: ${ACTION})"
+  exceeded=$(jq -r --argjson t "$THRESHOLD" \
+    '[.[] | select(.percent >= $t) | "\(.kind) \(.percent)%"] | join(", ")' <<<"$limits")
+  if [[ -n "$exceeded" ]]; then
+    log "THRESHOLD EXCEEDED ($exceeded)"
+    if [[ "${PROBE_ONLY:-0}" == 1 ]]; then log "probe: would run ACTION=$ACTION ($exceeded)"
+    elif ! run_action "$exceeded"; then
+      local tmp
+      tmp=$(mktemp "$STATE_DIR/health.XXXXXX")
+      jq '.status = "action_failed"' "$STATE" >"$tmp"
+      mv "$tmp" "$STATE"
+      return 1
+    fi
+  fi
+}
+
+desktop_fallback() {
+  local data tmp now sample
+  now=$(date +%s)
+  if ! data=$(read_desktop_usage 2>/dev/null); then
+    log "Desktop fallback unavailable: requires matching account/org and a valid sample no older than 300s"
+    # Do not leave a previously healthy fallback green after its sample expires.
+    if jq -e '.status == "ok_desktop"' "$STATE" >/dev/null 2>&1; then
+      tmp=$(mktemp "$STATE_DIR/health.XXXXXX")
+      jq '.status = "desktop_cache_unavailable"' "$STATE" >"$tmp"
+      mv "$tmp" "$STATE"
+    fi
+    return 1
+  fi
+  sample=$(jq -r '.sampled_at' <<<"$data")
+  tmp=$(mktemp "$STATE_DIR/health.XXXXXX")
+  # Preserve primary backoff and failure count. Successful fallback reads must
+  # not cause another OAuth request before the provider cooldown expires.
+  jq --argjson now "$now" --argjson sample "$sample" '
+    .primary_status //= .status |
+    .status = "ok_desktop" | .source = "desktop_cache" |
+    .last_success = $now | .sampled_at = $sample' "$STATE" >"$tmp"
+  mv "$tmp" "$STATE"
+  log "Desktop fallback: verified account/org, sample age $((now - sample))s"
+  apply_limits "$(jq -c '.limits' <<<"$data")" desktop_cache
+}
+
+# Run checks serially, including manual checks. Backoff never uses stale usage
+# to trigger an action. A failed check remains visibly unhealthy.
+do_check() (
+  umask 077
+  mkdir -p "$STATE_DIR"
+  if [[ "$OS" == linux ]]; then
+    exec 9>"$STATE_DIR/check.lock"
+    flock -n 9 || { log "check already running"; return 0; }
+  else
+    mkdir "$STATE_DIR/check.lockdir" 2>/dev/null || return 0
+    trap 'rmdir "$STATE_DIR/check.lockdir"' EXIT
+  fi
+  local token resp code limits now next delay expiry attempt headers
+  now=$(date +%s)
+  next=$(jq -r '.next_attempt // 0' "$STATE" 2>/dev/null) || next=0
+  if (( now < next )); then
+    log "waiting before next attempt (${next}); see claude-guard status"
+    desktop_fallback; return $?
+  fi
   token=$(get_token || true)
   if [[ -z "$token" ]]; then
-    log "ERROR: could not read the OAuth token — skipping check"; return 0
+    log "ERROR: could not read the OAuth token; sign in in Claude Code (/login)"
+    set_health authentication_error 300; desktop_fallback; return $?
   fi
-  resp=$(curl -s -m 30 \
-    -H "Authorization: Bearer $token" \
-    -H "anthropic-beta: oauth-2025-04-20" \
-    "https://api.anthropic.com/api/oauth/usage" 2>/dev/null || true)
-  if ! jq -e '.limits' >/dev/null 2>&1 <<<"$resp"; then
-    log "ERROR: unexpected endpoint response — skipping check. Raw: $(head -c 200 <<<"$resp" | tr '\n' ' ' | tr -s ' ')"; return 0
+  expiry=0
+  if [[ "$OS" != mac ]]; then
+    expiry=$(jq -r '.claudeAiOauth.expiresAt // 0' "$CREDS" 2>/dev/null) || expiry=0
   fi
-  summary=$(jq -r '[.limits[] | "\(.kind)=\(.percent)%"] | join(", ")' <<<"$resp")
-  log "limits: ${summary} (threshold: ${THRESHOLD}%, action: ${ACTION})"
-  exceeded=$(jq -r --argjson t "$THRESHOLD" \
-    '[.limits[] | select(.percent >= $t) | "\(.kind) \(.percent)%"] | join(", ")' <<<"$resp")
-  [[ -n "$exceeded" ]] && { log "THRESHOLD EXCEEDED ($exceeded)"; run_action "$exceeded"; }
+  if (( expiry > 0 && expiry / 1000 <= now + 60 )); then
+    if ! refresh_token; then set_health "$REFRESH_STATUS" "$REFRESH_DELAY"; desktop_fallback; return $?; fi
+    token=$(get_token)
+  fi
+  headers=$(mktemp "$STATE_DIR/headers.XXXXXX")
+  for attempt in 1 2; do
+    # Feed the bearer through stdin rather than exposing it in argv.
+    if ! resp=$(printf 'header = "Authorization: Bearer %s"\n' "$token" |
+      curl --config - -sS --connect-timeout 10 -m 30 -D "$headers" -w '\n%{http_code}' \
+        -H 'anthropic-beta: oauth-2025-04-20' \
+        'https://api.anthropic.com/api/oauth/usage' 2>/dev/null); then
+      rm -f "$headers"
+      log "ERROR: usage request failed (network)"
+      set_health network_error 120; desktop_fallback; return $?
+    fi
+    code="${resp##*$'\n'}"; resp="${resp%$'\n'*}"
+    if [[ "$code" == 401 && "$attempt" == 1 ]]; then
+      if ! refresh_token; then
+        rm -f "$headers"; set_health "$REFRESH_STATUS" "$REFRESH_DELAY"; desktop_fallback; return $?
+      fi
+      token=$(get_token)
+    else break; fi
+  done
+  if [[ "$code" == 429 ]]; then
+    delay=$(retry_delay "$headers")
+    rm -f "$headers"
+    log "ERROR: usage endpoint rate limited (HTTP 429); retry in ${delay}s"
+    set_health rate_limited "$delay"; desktop_fallback; return $?
+  fi
+  rm -f "$headers"
+  if [[ "$code" != 200 ]]; then
+    log "ERROR: usage request rejected (HTTP $code)"
+    set_health "http_$code" 300; desktop_fallback; return $?
+  fi
+  if ! limits=$(normalize_limits <<<"$resp" 2>/dev/null); then
+    log "ERROR: unrecognized usage response; no action taken"
+    set_health invalid_response 300; desktop_fallback; return $?
+  fi
+  set_health ok
+  apply_limits "$limits" oauth || return 1
   return 0
-}
+)
 
 # ── Scheduler control (systemd / launchd) ────────────────────────
 scheduler_active() {
@@ -280,6 +564,7 @@ Usage: claude-guard [command]
   grace <seconds>   Seconds of warning before acting
   interval <value>  How often to check: 90s | 2m | 1h  (min 30s)
   on | off          Turn the guard on / off
+  probe             Read current usage without running the configured action
   now               Run a check right now
   check             (internal, used by the scheduler) run one check
   log               Follow the log live (Ctrl-C to exit)
@@ -290,7 +575,8 @@ EOF
 cmd="${1:-status}"
 case "$cmd" in
   check) do_check ;;
-  now)   echo "Running a check…"; do_check; tail -n 2 "$LOG" 2>/dev/null | sed 's/^/  /' ;;
+  probe) PROBE_ONLY=1; rc=0; do_check || rc=$?; tail -n 3 "$LOG"; exit "$rc" ;;
+  now)   echo "Running a check…"; rc=0; do_check || rc=$?; tail -n 2 "$LOG" 2>/dev/null | sed 's/^/  /'; exit "$rc" ;;
   status|"")
     echo "── Config (${CONF}) ──"
     echo "  OS:         ${OS}"
@@ -303,6 +589,24 @@ case "$cmd" in
     echo "── Guard ──"
     if scheduler_active; then echo "  State:   ON  ✓"; else echo "  State:   OFF ✗   (turn it on with: claude-guard on)"; fi
     scheduler_status
+    if [[ -f "$STATE" ]]; then
+      if jq -e --argjson now "$(date +%s)" '
+        .source == "desktop_cache" and ($now - (.sampled_at // 0) > 300)' "$STATE" >/dev/null; then
+        echo "  WARNING: Desktop sample is stale; cannot use it for a new threshold action"
+      fi
+      if jq -e --argjson now "$(date +%s)" --argjson interval "$INTERVAL_SECONDS" '
+        (.status == "ok" or .status == "ok_desktop") and ($now - .last_success > (2 * $interval + 60))' "$STATE" >/dev/null; then
+        echo "  WARNING: last successful check is stale"
+      fi
+      jq -r '"  Health:  " + .status,
+        "  Source:  " + (.source // "none"),
+        "  Primary API: " + (.primary_status // .status),
+        (if .sampled_at then "  Desktop sample (UTC): " + (.sampled_at | todateiso8601) else empty end),
+        "  Last successful check (UTC): " + (if .last_success > 0 then (.last_success | todateiso8601) else "never" end),
+        "  Next attempt (UTC): " + (.next_attempt | todateiso8601)' "$STATE"
+    else
+      echo "  Health:  unknown (no verified check recorded)"
+    fi
     echo
     echo "── Recent checks ──"
     tail -n 5 "$LOG" 2>/dev/null | sed 's/^/  /' || echo "  (no records yet)"
