@@ -44,7 +44,8 @@ printf '%s\\n' "$*" >> "$FIXTURES/actions"
 ''')
         self.mock('pgrep', '#!/bin/sh\nexit 1\n')
         self.mock('sleep', '#!/bin/sh\nexit 0\n')
-        self.mock('notify-send', '#!/bin/sh\nexit 0\n')
+        self.mock('notify-send', '#!/bin/sh\necho notified >> "$FIXTURES/notifications"\n')
+        self.mock('systemctl', '#!/bin/sh\necho "$*" >> "$FIXTURES/scheduler"\n')
         self.mock('wall', '#!/bin/sh\ncat >/dev/null\n')
         self.usage({'limits': [{'kind': 'session', 'percent': 31}]})
         (self.root / 'refresh.json').write_text(json.dumps({'access_token': 'new-access', 'refresh_token': 'new-refresh', 'expires_in': 3600}) + '\n200')
@@ -353,6 +354,81 @@ case "$*" in *native-binary*) exit 1 ;; esac
         self.assertEqual(self.run_guard().returncode, 0)
         self.assertEqual(self.health()['status'], 'ok_desktop')
         self.assertFalse((self.root / 'calls').exists())
+
+    def expire_outage(self):
+        (self.root / 'state/outage-start').write_text(str(int(time.time()) - 601))
+
+    def test_stale_warning_waits_then_notifies_once_across_manual_checks(self):
+        self.usage({}, 503)
+        self.run_guard()
+        self.assertFalse((self.root / 'notifications').exists())
+        self.expire_outage()
+        self.assertNotEqual(self.run_guard().returncode, 0)
+        self.assertNotEqual(self.run_guard('now').returncode, 0)
+        self.assertEqual((self.root / 'notifications').read_text().splitlines(), ['notified'])
+        self.assertFalse((self.root / 'actions').exists())
+
+    def test_recovery_allows_one_warning_in_next_outage(self):
+        self.usage({}, 503)
+        self.run_guard()
+        self.expire_outage()
+        self.run_guard()
+        state = self.health()
+        state['next_attempt'] = 0
+        (self.root / 'state/health.json').write_text(json.dumps(state))
+        self.usage({'limits': [{'kind': 'session', 'percent': 10}]})
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertFalse((self.root / 'state/stale-notified').exists())
+        self.usage({}, 503)
+        self.run_guard()
+        self.expire_outage()
+        self.run_guard()
+        self.assertEqual(len((self.root / 'notifications').read_text().splitlines()), 2)
+
+    def test_desktop_recovery_resets_outage_warning(self):
+        self.usage({}, 429)
+        self.run_guard()
+        self.expire_outage()
+        self.run_guard()
+        self.desktop_sample()
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertFalse((self.root / 'state/stale-notified').exists())
+        self.assertFalse((self.root / 'state/outage-start').exists())
+
+    def test_threshold_disarms_timer_and_manual_checks_until_reenabled(self):
+        self.usage({'limits': [{'kind': 'session', 'percent': 95}]})
+        self.assertEqual(self.run_guard().returncode, 0)
+        before = (self.root / 'actions').read_text()
+        self.assertTrue((self.root / 'state/action-disarmed').exists())
+        self.assertIn('disable --now claude-guard.timer', (self.root / 'scheduler').read_text())
+        self.assertEqual(self.run_guard('now').returncode, 0)
+        self.assertEqual((self.root / 'actions').read_text(), before)
+        self.assertEqual((self.root / 'notifications').read_text().splitlines(), ['notified'])
+        self.assertEqual(self.run_guard('on').returncode, 0)
+        self.assertFalse((self.root / 'state/action-disarmed').exists())
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertEqual(len((self.root / 'notifications').read_text().splitlines()), 2)
+
+    def test_action_latch_prevents_repeats_when_scheduler_disable_fails(self):
+        self.mock('systemctl', '#!/bin/sh\nexit 1\n')
+        self.usage({'limits': [{'kind': 'session', 'percent': 95}]})
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertEqual((self.root / 'notifications').read_text().splitlines(), ['notified'])
+
+    def test_failed_action_does_not_repeat(self):
+        self.mock('pgrep', '#!/bin/sh\nexit 0\n')
+        self.usage({'limits': [{'kind': 'session', 'percent': 95}]})
+        self.assertNotEqual(self.run_guard().returncode, 0)
+        self.assertEqual(self.health()['status'], 'action_failed')
+        self.assertEqual(self.run_guard().returncode, 0)
+        self.assertEqual((self.root / 'notifications').read_text().splitlines(), ['notified'])
+
+    def test_probe_neither_disarms_nor_notifies(self):
+        self.usage({'limits': [{'kind': 'session', 'percent': 95}]})
+        self.assertEqual(self.run_guard('probe').returncode, 0)
+        self.assertFalse((self.root / 'state/action-disarmed').exists())
+        self.assertFalse((self.root / 'notifications').exists())
 
     def test_secrets_never_logged(self):
         self.set_creds(expired=True)

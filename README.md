@@ -85,6 +85,24 @@ python3 -m unittest discover -s tests -v
 The tests mock HTTP requests and process termination. For a real query without
 running the configured action, use `claude-guard probe`.
 
+## Missing usage notifications
+
+The command output and notifications are in English. Other languages are not
+currently supported.
+
+After ten minutes without valid usage data from either source, the guard sends
+one desktop notification with recovery steps: renew Claude Code with `/login`,
+open Desktop Settings > Usage to request a fresh reading, respect any HTTP 429
+cooldown, and check `claude-guard probe` and `claude-guard status`. These steps
+may not restore access immediately; the guard verifies the next reading.
+
+The notification is persisted once per outage, including manual checks and
+restarts. A successful reading clears the episode so a later outage can send
+one new notification. Without a successful reading on a new installation, the
+ten minutes start at the first failed check. Missing data does not close apps.
+`probe` does not send notifications. Change `STALE_NOTIFY_SECONDS` in the config
+to adjust the ten-minute default (600 seconds).
+
 ## Desktop usage fallback
 
 The primary usage source is the local Claude Code OAuth session. If the API
@@ -150,8 +168,11 @@ that stays alive is recorded as `action_failed`. Forced termination can lose
 unsaved local work. Standalone Claude Code CLI sessions and Claude in a
 browser are outside this action's scope.
 
-> With `kill-claude`, if you're still above the threshold the guard will close
-> it again on each scheduled check. To keep working, run `claude-guard off`.
+Every threshold action disarms the guard before acting and sends one warning.
+The timer is disabled; a persistent latch also prevents manual `now` or `check`
+commands from repeating the action, even if disabling the timer fails. This
+also applies when closing an application fails: inspect `status`, then re-arm
+explicitly with `claude-guard on`. `probe` remains available without acting.
 
 > `poweroff` and `suspend` **turn the guard off on their way out**. The limit is
 > still exceeded when the machine stops, so a guard left on would power off (or

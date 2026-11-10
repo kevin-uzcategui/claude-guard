@@ -22,6 +22,7 @@ THRESHOLD=90
 ACTION=kill-claude
 GRACE_SECONDS=10
 INTERVAL_SECONDS=60
+STALE_NOTIFY_SECONDS=600
 
 # ── Scheduler identifiers ────────────────────────────────────────
 TIMER="claude-guard.timer"
@@ -50,7 +51,7 @@ notify() {
   local msg="$1"
   case "$OS" in
     linux)
-      command -v notify-send >/dev/null && notify-send -u critical "Claude Code" "$msg" 2>/dev/null || true
+      command -v notify-send >/dev/null && notify-send -u critical -t 0 "Claude guard" "$msg" 2>/dev/null || true
       command -v wall >/dev/null && echo "$msg" | wall 2>/dev/null || true ;;
     mac)
       command -v osascript >/dev/null && \
@@ -143,14 +144,8 @@ close_editor() {
   esac
 }
 
-# poweroff and suspend stop the machine while the limit is still exceeded, so the
-# guard turns itself off before acting. Otherwise the next boot (or resume) runs
-# the check, finds the very same limit, and stops the machine again: a loop with
-# no way out until the limit window rolls over. Turn it back on with:
-#   claude-guard on
-# It never takes down the process running this action: on Linux only the timer
-# unit is stopped (the service running this script is a separate unit), and on
-# macOS the job is marked disabled instead of unloaded, which would kill it.
+# Every threshold action disarms the guard. The action latch also prevents
+# repeated manual checks from acting if scheduler shutdown fails.
 self_disable() {
   local what="$1" ok=0
   case "$OS" in
@@ -167,25 +162,26 @@ self_disable() {
 # ── Action taken when the threshold is reached ───────────────────
 run_action() {
   local reason="$1"
+  case "$ACTION" in kill-claude|vscode|poweroff|suspend) ;; *) return 1 ;; esac
+  printf '%s\n' "$(date +%s)" >"$STATE_DIR/action-disarmed"
+  self_disable "$ACTION"
   case "$ACTION" in
     kill-claude)
-      notify "Limit reached (${reason}). Closing Claude Desktop and Claude Code in ${GRACE_SECONDS}s…"
+      notify "Limit reached (${reason}). Closing Claude Desktop and Claude Code in ${GRACE_SECONDS}s. Guard disabled. Re-enable with: claude-guard on"
       log "ACTION=kill-claude ($reason): closing Claude Desktop and the Claude Code plugin in ${GRACE_SECONDS}s"
       sleep "$GRACE_SECONDS"
       close_claude ;;
     vscode)
-      notify "Limit reached (${reason}). Closing the editor in ${GRACE_SECONDS}s…"
+      notify "Limit reached (${reason}). Closing the editor in ${GRACE_SECONDS}s. Guard disabled. Re-enable with: claude-guard on"
       log "ACTION=vscode ($reason) — closing the editor in ${GRACE_SECONDS}s"
       sleep "$GRACE_SECONDS"; close_editor && log "editor closed" || log "no editor found" ;;
     poweroff)
       notify "Limit reached (${reason}). Powering off in ${GRACE_SECONDS}s… The guard turns itself off, so the next boot will not power off again."
       log "ACTION=poweroff ($reason) — powering off in ${GRACE_SECONDS}s"
-      self_disable poweroff
       sleep "$GRACE_SECONDS"; power_off ;;
     suspend)
       notify "Limit reached (${reason}). Suspending in ${GRACE_SECONDS}s… The guard turns itself off, so waking up will not suspend again."
       log "ACTION=suspend ($reason) — suspending in ${GRACE_SECONDS}s"
-      self_disable suspend
       sleep "$GRACE_SECONDS"; suspend_machine ;;
     *) log "ERROR: unknown ACTION '$ACTION' — doing nothing" ;;
   esac
@@ -357,8 +353,10 @@ desktop_fallback() {
       jq '.status = "desktop_cache_unavailable"' "$STATE" >"$tmp"
       mv "$tmp" "$STATE"
     fi
+    warn_stale_usage
     return 1
   fi
+  reset_outage
   sample=$(jq -r '.sampled_at' <<<"$data")
   tmp=$(mktemp "$STATE_DIR/health.XXXXXX")
   # Preserve primary backoff and failure count. Successful fallback reads must
@@ -372,6 +370,31 @@ desktop_fallback() {
   apply_limits "$(jq -c '.limits' <<<"$data")" desktop_cache
 }
 
+# One warning per outage, persisted across timer/manual checks and reboots.
+# Recovery clears the episode. Failure to read usage never closes applications.
+warn_stale_usage() {
+  local now baseline elapsed
+  [[ "${PROBE_ONLY:-0}" == 1 ]] && return 0
+  [[ -f "$STATE_DIR/stale-notified" ]] && return 0
+  now=$(date +%s)
+  if [[ ! -f "$STATE_DIR/outage-start" ]]; then
+    baseline=$(jq -r '.last_success // 0' "$STATE" 2>/dev/null) || baseline=0
+    (( baseline > 0 && baseline <= now )) || baseline=$now
+    printf '%s\n' "$baseline" >"$STATE_DIR/outage-start"
+  fi
+  baseline=$(cat "$STATE_DIR/outage-start")
+  elapsed=$((now - baseline))
+  if (( elapsed >= STALE_NOTIFY_SECONDS )); then
+    printf '%s\n' "$now" >"$STATE_DIR/stale-notified"
+    notify "Claude guard: $((elapsed / 60)) minutes without valid usage data. Automatic closing cannot detect the limit. In Claude Code run /login; in Desktop open Settings > Usage to request a fresh reading. If HTTP 429 persists, wait for the cooldown. Verify with: claude-guard probe and claude-guard status. This warning will not repeat until data recovers."
+    log "WARNING: no valid usage for ${elapsed}s; one notification sent for this outage"
+  fi
+}
+
+reset_outage() {
+  rm -f "$STATE_DIR/outage-start" "$STATE_DIR/stale-notified"
+}
+
 # Run checks serially, including manual checks. Backoff never uses stale usage
 # to trigger an action. A failed check remains visibly unhealthy.
 do_check() (
@@ -383,6 +406,10 @@ do_check() (
   else
     mkdir "$STATE_DIR/check.lockdir" 2>/dev/null || return 0
     trap 'rmdir "$STATE_DIR/check.lockdir"' EXIT
+  fi
+  if [[ -f "$STATE_DIR/action-disarmed" && "${PROBE_ONLY:-0}" != 1 ]]; then
+    log "guard disarmed after action; re-enable with: claude-guard on"
+    return 0
   fi
   local token resp code limits now next delay expiry attempt headers
   now=$(date +%s)
@@ -438,6 +465,7 @@ do_check() (
     log "ERROR: unrecognized usage response; no action taken"
     set_health invalid_response 300; desktop_fallback; return $?
   fi
+  reset_outage
   set_health ok
   apply_limits "$limits" oauth || return 1
   return 0
@@ -451,6 +479,7 @@ scheduler_active() {
   esac
 }
 enable_guard() {
+  rm -f "$STATE_DIR/action-disarmed"
   case "$OS" in
     linux) [[ -f "$UNIT_DIR/$TIMER" ]] || sync_scheduler
            systemctl --user enable --now "$TIMER" ;;
@@ -588,6 +617,10 @@ case "$cmd" in
     echo
     echo "── Guard ──"
     if scheduler_active; then echo "  State:   ON  ✓"; else echo "  State:   OFF ✗   (turn it on with: claude-guard on)"; fi
+    if [[ -f "$STATE_DIR/action-disarmed" ]]; then
+      echo "  Action: disarmed after threshold action (re-enable with: claude-guard on)"
+    fi
+    echo "  Missing-data warning: after ${STALE_NOTIFY_SECONDS}s, once per outage"
     scheduler_status
     if [[ -f "$STATE" ]]; then
       if jq -e --argjson now "$(date +%s)" '

@@ -10,8 +10,8 @@ THRESHOLD=90
 #   vscode       -> close the whole editor (and whatever runs inside it).
 #   poweroff     -> power off the machine.
 #   suspend      -> suspend (sleep) the machine.
-# poweroff and suspend turn the guard off as they act, so bringing the machine
-# back does not stop it again while the limit is still exceeded. Re-arm it with
+# All threshold actions turn the guard off to avoid repeated notifications
+# and actions. Re-arm it with
 # `claude-guard on`.
 ACTION=kill-claude
 
@@ -21,3 +21,6 @@ GRACE_SECONDS=10
 # How often to check, in seconds (min 30). Change it with `claude-guard interval`
 # (accepts 90s / 2m / 1h) so the scheduler is regenerated automatically.
 INTERVAL_SECONDS=120
+
+# Send one warning per outage after this many seconds without valid data.
+STALE_NOTIFY_SECONDS=600
